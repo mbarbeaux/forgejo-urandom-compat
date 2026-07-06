@@ -36,18 +36,18 @@ portability.
 
 ## Usage
 
-```bash
-./build.sh
-```
+Pull the pre-built image from GitHub Container Registry:
 
-This produces an image named `forgejo:15-rootless-synology-compatible`.
+```bash
+docker pull ghcr.io/mbarbeaux/forgejo-urandom-compat:latest
+```
 
 Then update your `docker-compose.yml`:
 
 ```yaml
 services:
   forgejo:
-    image: forgejo:15-rootless-synology-compatible  # instead of codeberg.org/forgejo/forgejo:15-rootless
+    image: ghcr.io/mbarbeaux/forgejo-urandom-compat:latest  # instead of codeberg.org/forgejo/forgejo:15-rootless
     # ... rest of your configuration unchanged
 ```
 
@@ -55,6 +55,12 @@ Then recreate the container:
 
 ```bash
 docker compose up -d
+```
+
+Alternatively, you can build the image yourself locally:
+
+```bash
+docker build -t forgejo-urandom-compat .
 ```
 
 ## How it works
@@ -104,25 +110,21 @@ It triggers:
 **Making the package public**: the first time the workflow pushes the
 image, the resulting GHCR package is **private by default**, even if the
 repository is public. So, once, you need to go to
-`https://github.com/users/<owner>/packages/container/forgejo-urandom-compat/settings`
+`https://github.com/users/mbarbeaux/packages/container/forgejo-urandom-compat/settings`
 and switch its visibility to *Public* to allow an unauthenticated
-`docker pull`.
-
-Once public:
-
-```bash
-docker pull ghcr.io/<owner>/forgejo-urandom-compat:latest
-```
+`docker pull` (see the [Usage](#usage) section above).
 
 ## Maintenance
 
 - **Updating Forgejo**: just change the tag on the
   `FROM codeberg.org/forgejo/forgejo:15-rootless` line in the `Dockerfile`,
-  then rerun `./build.sh`. The Git version will automatically be
-  realigned with the one bundled in the new official image.
+  then rerun `docker build -t forgejo-urandom-compat .`.
+  The Git version will automatically be realigned with the one bundled in
+  the new official image.
 - **Verifying after a build**: the build deliberately fails (`exit 1`) if
-  the compiled binary doesn't use `/dev/urandom` — so a `./build.sh` that
-  finishes without error is itself a guarantee that the fix is active.
+  the compiled binary doesn't use `/dev/urandom` — so a
+  `docker build` that finishes without error is itself a guarantee that
+  the fix is active.
 - **Known limitation**: if Alpine ships an urgent Git security fix
   without changing the version number reported by `git --version`, our
   build — recompiled from the official GitHub tag — won't include it

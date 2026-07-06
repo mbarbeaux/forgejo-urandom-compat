@@ -1,5 +1,7 @@
 # forgejo-urandom-compat
 
+[![Build and publish Docker image](https://github.com/mbarbeaux/forgejo-urandom-compat/actions/workflows/docker-build.yml/badge.svg?branch=main)](https://github.com/mbarbeaux/forgejo-urandom-compat/actions/workflows/docker-build.yml)
+
 ## Forgejo 15-rootless — Synology-compatible build (old kernel)
 
 This repository contains a `Dockerfile` that rebuilds the official

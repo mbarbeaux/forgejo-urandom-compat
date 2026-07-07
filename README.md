@@ -136,3 +136,7 @@ and switch its visibility to *Public* to allow an unauthenticated
 This `Dockerfile` was put together with the assistance of Claude
 (Anthropic), starting from an error encountered on a Synology DSM 7.2
 (kernel 3.10.108).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

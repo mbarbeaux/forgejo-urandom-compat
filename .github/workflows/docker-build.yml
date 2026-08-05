@@ -1,9 +1,24 @@
 name: Build and publish Docker image
 
-# Single branch (main): this workflow rebuilds the image on push (if the
-# Dockerfile or this workflow change), on a weekly schedule (to pick up
-# updates to the official codeberg.org/forgejo/forgejo:15-rootless image,
-# e.g. Alpine/Git security patches), and manually on demand.
+# Single branch (main): this workflow discovers every Forgejo rootless
+# RELEASE published upstream (codeberg.org/forgejo/forgejo, exact tags
+# matching "<major>.<minor>.<patch>-rootless", major >= MIN_MAJOR_VERSION)
+# -- across every major line, with no hardcoded list -- and builds one
+# image per release that isn't already published on ghcr.io yet. This
+# means:
+#   - a brand new major (e.g. 17.0.0-rootless) is picked up automatically;
+#   - a new patch on an existing major (e.g. 16.0.3-rootless) is picked up
+#     automatically too;
+#   - a release that was already built in a previous run is never rebuilt
+#     (exact version tags are immutable upstream, so there is nothing to
+#     gain from rebuilding them -- this saves CI/runner time).
+# Runs on push (if the Dockerfile or this workflow change), on a daily
+# schedule (to catch new releases within a day, with no manual
+# intervention -- the discover job is cheap and skips the build job
+# entirely when there's nothing new, so a daily cadence costs nothing
+# extra on days without a new release), and manually on demand --
+# optionally restricted to a single release, which forces a rebuild of
+# that release even if already published.
 on:
   push:
     branches: [main]
@@ -11,8 +26,17 @@ on:
       - Dockerfile
       - .github/workflows/docker-build.yml
   schedule:
-    - cron: "0 3 * * 1" # every Monday at 03:00 UTC
-  workflow_dispatch: {}
+    - cron: "0 3 * * *" # every day at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      forgejo_version:
+        description: >-
+          Exact Forgejo rootless release to (re)build, e.g. "16.0.2-rootless".
+          Forces a rebuild even if that release was already published.
+          Leave empty to build every release (>= 15.0.0-rootless) that
+          isn't already published yet.
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,13 +45,114 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  MIN_MAJOR_VERSION: 15
 
 jobs:
+  # Diffs every upstream Forgejo rootless release against what this
+  # repository has already published on ghcr.io, and exposes the
+  # difference to the build job as a matrix (one job per missing release).
+  # "latest" is always computed from the FULL upstream release list (not
+  # just the ones actually built this run), so skipping an already-built
+  # release never leaves "latest" pointing at a stale image, and a manual
+  # single-release dispatch never mislabels an old release as "latest".
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      versions: ${{ steps.discover.outputs.versions }}
+      latest: ${{ steps.discover.outputs.latest }}
+      major_latest: ${{ steps.discover.outputs.major_latest }}
+    steps:
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Discover missing Forgejo rootless releases
+        id: discover
+        env:
+          REQUESTED_VERSION: ${{ inputs.forgejo_version }}
+        run: |
+          set -euo pipefail
+
+          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+-rootless$'
+
+          upstream_versions="$(skopeo list-tags docker://codeberg.org/forgejo/forgejo | jq -r '.Tags[]' \
+            | grep -E "${version_pattern}" \
+            | awk -F. -v min="${MIN_MAJOR_VERSION}" '$1 >= min {print}' \
+            | sort -t. -k1,1n -k2,2n -k3,3n)"
+
+          if [ -z "${upstream_versions}" ]; then
+            echo "No matching Forgejo rootless releases found (major >= ${MIN_MAJOR_VERSION})" >&2
+            exit 1
+          fi
+
+          latest="$(echo "${upstream_versions}" | tail -n1)"
+
+          # Per major line, the latest patch found (upstream_versions is
+          # sorted ascending by major,minor,patch, so the last line seen
+          # for a given major is always its highest one). Exposed as
+          # {"15":"15.0.6-rootless","16":"16.0.2-rootless",...} so the
+          # build job can tag whichever release matches its major's entry
+          # with a floating "<major>-rootless" tag -- no hardcoded list of
+          # majors, works the same for a future 17, 18...
+          major_latest="$(echo "${upstream_versions}" | awk -F. \
+            '{lat[$1]=$0} END {printf "{"; sep=""; for (m in lat) {printf "%s\"%s\":\"%s\"", sep, m, lat[m]; sep=","}; printf "}"}' \
+            | jq -c .)"
+
+          # Log in read-only to check our own already-published tags, even
+          # if the ghcr.io package is private. A missing package (first
+          # ever run) is not an error: it just means nothing is built yet.
+          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login "${REGISTRY}" \
+            --username "${{ github.actor }}" --password-stdin
+
+          if built_raw="$(skopeo list-tags "docker://${REGISTRY}/${IMAGE_NAME}" 2>/dev/null)"; then
+            built_versions="$(echo "${built_raw}" | jq -r '.Tags[]?' | grep -E "${version_pattern}" | sort -u)"
+          else
+            echo "No existing ${IMAGE_NAME} package found on ${REGISTRY} yet -- nothing considered built so far."
+            built_versions=""
+          fi
+
+          if [ -n "${REQUESTED_VERSION}" ]; then
+            if ! echo "${upstream_versions}" | grep -qx "${REQUESTED_VERSION}"; then
+              echo "Requested version '${REQUESTED_VERSION}' was not found among published upstream releases:" >&2
+              echo "${upstream_versions}" >&2
+              exit 1
+            fi
+            echo "Manual override: forcing a rebuild of ${REQUESTED_VERSION} regardless of already-built state."
+            to_build="${REQUESTED_VERSION}"
+          else
+            to_build="$(comm -23 <(echo "${upstream_versions}") <(echo "${built_versions}" | sed '/^$/d'))"
+          fi
+
+          echo "Upstream releases (major >= ${MIN_MAJOR_VERSION}):"
+          echo "${upstream_versions}"
+          echo "Already published on ${REGISTRY}:"
+          echo "${built_versions:-<none>}"
+          echo "Latest: ${latest}"
+          echo "Latest per major: ${major_latest}"
+          echo "To build this run:"
+          echo "${to_build:-<nothing -- everything already built>}"
+
+          {
+            echo "versions=$(echo "${to_build}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+            echo "latest=${latest}"
+            echo "major_latest=${major_latest}"
+          } >> "$GITHUB_OUTPUT"
+
   build:
+    needs: discover
+    # Empty matrix (nothing new to build) -> skip the job entirely instead
+    # of spinning up a no-op run.
+    if: needs.discover.outputs.versions != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        forgejo_version: ${{ fromJson(needs.discover.outputs.versions) }}
 
     steps:
       - name: Checkout
@@ -35,8 +160,8 @@ jobs:
 
       # GitHub-hosted runners are amd64 only. QEMU lets buildx also produce
       # the arm64 and arm/v6 images, to exactly match the architectures
-      # published by the official codeberg.org/forgejo/forgejo:15-rootless
-      # image.
+      # published by the official codeberg.org/forgejo/forgejo image, all
+      # within this single job for this one Forgejo release.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -50,21 +175,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Determines whether this job's release is the latest patch of its
+      # own major line, to decide whether it should also get the floating
+      # "<major>-rootless" tag (e.g. 16.0.2-rootless -> also tag
+      # 16-rootless). Done in shell rather than a workflow expression:
+      # GitHub Actions expressions have no string-splitting function to
+      # pull the major out of "16.0.2-rootless".
+      - name: Determine major-line tag
+        id: majortag
+        env:
+          MAJOR_LATEST_JSON: ${{ needs.discover.outputs.major_latest }}
+          VERSION: ${{ matrix.forgejo_version }}
+        run: |
+          set -euo pipefail
+          major="${VERSION%%.*}"
+          latest_for_major="$(echo "${MAJOR_LATEST_JSON}" | jq -r --arg m "${major}" '.[$m] // ""')"
+          is_latest="false"
+          if [ "${latest_for_major}" = "${VERSION}" ]; then
+            is_latest="true"
+          fi
+          echo "tag=${major}-rootless" >> "$GITHUB_OUTPUT"
+          echo "is_major_latest=${is_latest}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
+            type=raw,value=${{ matrix.forgejo_version }}
+            type=raw,value=${{ steps.majortag.outputs.tag }},enable=${{ steps.majortag.outputs.is_major_latest == 'true' }}
+            type=raw,value=latest,enable=${{ matrix.forgejo_version == needs.discover.outputs.latest }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          # Same architectures as codeberg.org/forgejo/forgejo:15-rootless
-          # (verified via `docker manifest inspect`): amd64, arm64, arm/v6.
+          build-args: |
+            FORGEJO_TAG=${{ matrix.forgejo_version }}
+          # Same architectures as the official image (verified via
+          # `docker manifest inspect`): amd64, arm64, arm/v6.
           platforms: linux/amd64,linux/arm64,linux/arm/v6
           push: true
           tags: ${{ steps.meta.outputs.tags }}

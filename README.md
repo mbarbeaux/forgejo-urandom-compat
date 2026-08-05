@@ -2,14 +2,15 @@
 
 [![Build and publish Docker image](https://github.com/mbarbeaux/forgejo-urandom-compat/actions/workflows/docker-build.yml/badge.svg?branch=main)](https://github.com/mbarbeaux/forgejo-urandom-compat/actions/workflows/docker-build.yml)
 
-## Forgejo 15-rootless — Synology-compatible build (old kernel)
+## Forgejo rootless (>= 15) — Synology-compatible build (old kernel)
 
 This repository contains a `Dockerfile` that rebuilds the official
-[`codeberg.org/forgejo/forgejo:15-rootless`](https://codeberg.org/forgejo/forgejo)
-image with a **recompiled Git binary**, to make it compatible with Synology
-NAS devices (and more generally any system running a **Linux kernel older
-than 3.17**, such as the 3.10 kernel used by many Synology models even
-under recent DSM 7.x/7.3).
+[`codeberg.org/forgejo/forgejo`](https://codeberg.org/forgejo/forgejo)
+`<major>.<minor>.<patch>-rootless` images (every 15.x.y release and any
+newer major published upstream) with a **recompiled Git binary**, to make
+them compatible with Synology NAS devices (and more generally any system
+running a **Linux kernel older than 3.17**, such as the 3.10 kernel used
+by many Synology models even under recent DSM 7.x/7.3).
 
 ## The problem being solved
 
@@ -36,10 +37,19 @@ portability.
 
 ## Usage
 
-Pull the pre-built image from GitHub Container Registry:
+Pull the pre-built image from GitHub Container Registry. One image is
+published per upstream Forgejo release (e.g. `15.0.6-rootless`,
+`16.0.2-rootless`...). Two kinds of moving tags are also kept up to date:
+`latest` always points to the most recent release overall, and
+`<major>-rootless` (e.g. `15-rootless`, `16-rootless`...) always points to
+the most recent release within that major line:
 
 ```bash
 docker pull ghcr.io/mbarbeaux/forgejo-urandom-compat:latest
+# or follow a specific Forgejo major (auto-updates on new patches):
+docker pull ghcr.io/mbarbeaux/forgejo-urandom-compat:15-rootless
+# or pin an exact Forgejo release:
+docker pull ghcr.io/mbarbeaux/forgejo-urandom-compat:15.0.6-rootless
 ```
 
 Then update your `docker-compose.yml`:
@@ -47,7 +57,7 @@ Then update your `docker-compose.yml`:
 ```yaml
 services:
   forgejo:
-    image: ghcr.io/mbarbeaux/forgejo-urandom-compat:latest  # instead of codeberg.org/forgejo/forgejo:15-rootless
+    image: ghcr.io/mbarbeaux/forgejo-urandom-compat:15.0.6-rootless  # instead of codeberg.org/forgejo/forgejo:15.0.6-rootless
     # ... rest of your configuration unchanged
 ```
 
@@ -57,10 +67,12 @@ Then recreate the container:
 docker compose up -d
 ```
 
-Alternatively, you can build the image yourself locally:
+Alternatively, you can build a given version yourself locally, via the
+`FORGEJO_TAG` build argument (defaults to `15-rootless`, the floating tag
+for the latest 15.x.y release):
 
 ```bash
-docker build -t forgejo-urandom-compat .
+docker build -t forgejo-urandom-compat --build-arg FORGEJO_TAG=16.0.2-rootless .
 ```
 
 ## How it works
@@ -98,14 +110,28 @@ architectures as the official image (`amd64`, `arm64`, `arm/v6` — verified
 via `docker manifest inspect codeberg.org/forgejo/forgejo:15-rootless`),
 using QEMU emulation on GitHub's hosted (amd64-only) runners.
 
+The workflow first **discovers** every exact Forgejo rootless release
+published upstream at `codeberg.org/forgejo/forgejo` (major >= 15, across
+every major line), then builds one image **per release not already
+published** on `ghcr.io` — an already-built release is never rebuilt,
+since its upstream tag is immutable and rebuilding it would just waste CI
+time. The most recent release overall is tagged `latest`, and each major
+line's most recent release is additionally tagged `<major>-rootless`
+(e.g. `15-rootless`, `16-rootless`...). This means both a brand new major
+(e.g. `17.0.0-rootless`) and a new patch on an existing major (e.g.
+`16.0.3-rootless`) are picked up, built, and tagged automatically, with no
+manual change to this repository. Each release builds in its own job (all
+three architectures together), so releases build in parallel.
+
 It triggers:
 
 - on every push to `main` that modifies the `Dockerfile` (or the workflow
   itself);
-- weekly (every Monday), to automatically recompile and track updates to
-  the official `15-rootless` image (Alpine/Git security patches) with no
-  manual intervention;
-- manually, via the repository's *Actions* tab (`workflow_dispatch`).
+- daily (03:00 UTC), to detect and build any new Forgejo release
+  published in the meantime, across every supported major;
+- manually, via the repository's *Actions* tab (`workflow_dispatch`), with
+  an optional `forgejo_version` input to force a rebuild of one exact
+  release (e.g. `16.0.2-rootless`) even if it was already published.
 
 **Making the package public**: the first time the workflow pushes the
 image, the resulting GHCR package is **private by default**, even if the
@@ -116,20 +142,24 @@ and switch its visibility to *Public* to allow an unauthenticated
 
 ## Maintenance
 
-- **Updating Forgejo**: just change the tag on the
-  `FROM codeberg.org/forgejo/forgejo:15-rootless` line in the `Dockerfile`,
-  then rerun `docker build -t forgejo-urandom-compat .`.
-  The Git version will automatically be realigned with the one bundled in
-  the new official image.
+- **Updating Forgejo**: nothing to do — the CI workflow discovers every
+  upstream release on each run and builds whatever isn't published yet.
+  For a local, one-off build of a specific release, pass
+  `--build-arg FORGEJO_TAG=<major>.<minor>.<patch>-rootless` to
+  `docker build` (see [Usage](#usage) above). The Git version is always
+  realigned automatically with the one bundled in the corresponding
+  official image.
 - **Verifying after a build**: the build deliberately fails (`exit 1`) if
   the compiled binary doesn't use `/dev/urandom` — so a
   `docker build` that finishes without error is itself a guarantee that
   the fix is active.
-- **Known limitation**: if Alpine ships an urgent Git security fix
-  without changing the version number reported by `git --version`, our
-  build — recompiled from the official GitHub tag — won't include it
-  automatically. Watch for upstream Git security advisories in case of a
-  critical CVE.
+- **Known limitation**: because each release is built once and never
+  rebuilt (its upstream tag is immutable), an Alpine/Git security fix
+  shipped by upstream *without* a new Forgejo release tag won't reach an
+  already-published image automatically. Use the manual
+  `workflow_dispatch` (`forgejo_version` input) to force a rebuild of an
+  affected release if that ever happens, and watch upstream Git security
+  advisories in case of a critical CVE.
 
 ## Origin
 

@@ -2,9 +2,16 @@
 
 # ==============================================================================
 # Reference: the official Forgejo image, used twice below
-# (once as the build base, once as the final base)
+# (once as the build base, once as the final base).
+# FORGEJO_TAG selects which upstream rootless tag to rebuild -- a floating
+# major tag (e.g. 15-rootless) or an exact release (e.g. 16.0.2-rootless).
+# The CI workflow discovers every upstream release automatically and
+# builds one image per exact release not yet published (see
+# .github/workflows/docker-build.yml); for a local one-off build, override
+# it with `--build-arg FORGEJO_TAG=16.0.2-rootless`.
 # ==============================================================================
-FROM codeberg.org/forgejo/forgejo:15-rootless AS forgejo-original
+ARG FORGEJO_TAG=15-rootless
+FROM codeberg.org/forgejo/forgejo:${FORGEJO_TAG} AS forgejo-original
 
 # ==============================================================================
 # Build stage: compile Git INSIDE the official image itself, statically.

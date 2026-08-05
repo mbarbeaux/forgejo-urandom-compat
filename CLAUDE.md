@@ -5,10 +5,16 @@ Context for Claude (or any future revival of this repository).
 ## What this repository does
 
 A single `Dockerfile` that rebuilds the official
-`codeberg.org/forgejo/forgejo:15-rootless` image, replacing Alpine's `git`
+`codeberg.org/forgejo/forgejo:<major>.<minor>.<patch>-rootless` images
+(every 15.x.y release and any newer major), replacing Alpine's `git`
 binary with a version recompiled from source, to make it usable on a
 Linux kernel older than 3.17 (typically Synology NAS devices, many models
 of which still run kernel 3.10 even under recent DSM — DSM 7.2, 7.3...).
+The base tag is selected via the `FORGEJO_TAG` build arg (default
+`15-rootless`, the floating tag for the latest 15.x.y release); the CI
+workflow discovers every upstream release automatically and builds one
+image per release not yet published (see
+[CI/CD](#cicd-github-actions) below).
 
 Do not confuse this with a rework of Forgejo itself: only the Git binary
 is replaced, everything else in the image (Forgejo/Gitea, its
@@ -78,10 +84,10 @@ This error appears as soon as you try to create a repository (or run any
 
 See `Dockerfile` — a 3-stage approach:
 
-1. `FROM codeberg.org/forgejo/forgejo:15-rootless AS forgejo-original`:
-   reference image, used twice (as the build base AND the final base),
-   to guarantee zero environment drift (same Alpine/musl version as the
-   image being modified).
+1. `FROM codeberg.org/forgejo/forgejo:${FORGEJO_TAG} AS forgejo-original`
+   (`FORGEJO_TAG` defaults to `15-rootless`): reference image, used twice
+   (as the build base AND the final base), to guarantee zero environment
+   drift (same Alpine/musl version as the image being modified).
 2. `git-builder` stage, **`FROM forgejo-original`** (not a separate
    Alpine image): we directly query the `git --version` already
    installed in that image to know the exact version to recompile,
@@ -181,15 +187,55 @@ on Alpine 3.23. **Tested in production on a Synology DSM 7.2
 
 ## CI/CD (GitHub Actions)
 
-`.github/workflows/docker-build.yml` builds and publishes the image to
-GitHub Container Registry (`ghcr.io`), matching the official image's
-architectures — `amd64`, `arm64`, `arm/v6` (checked via
-`docker manifest inspect codeberg.org/forgejo/forgejo:15-rootless`) —
-using QEMU emulation on GitHub's amd64-only hosted runners.
+`.github/workflows/docker-build.yml` has two jobs:
+
+1. `discover`: uses `skopeo list-tags` against
+   `codeberg.org/forgejo/forgejo` to enumerate every published tag, keeps
+   the exact releases matching `^[0-9]+\.[0-9]+\.[0-9]+-rootless$` with
+   major >= `MIN_MAJOR_VERSION` (currently 15) across every major line
+   (this is what makes a brand new major, e.g. `17.0.0-rootless`, or a new
+   patch on an existing major, e.g. `16.0.3-rootless`, get picked up with
+   no manual change to this repository). It then logs into `ghcr.io`
+   (read-only, via `GITHUB_TOKEN`) and lists this repository's already
+   -published tags, to compute the SET DIFFERENCE: upstream releases minus
+   already-built releases. Only that difference is exposed as the build
+   matrix (`versions` output) — an already-built release is never
+   rebuilt, since its upstream tag is immutable (no point burning CI time
+   on it). `latest` (separate output) is always computed from the FULL
+   upstream release list, regardless of what's actually being built this
+   run, even when `workflow_dispatch.forgejo_version` restricts the build
+   to a single forced release — so a manual rebuild of an old release
+   never mislabels it `latest`, and skipping an already-built release
+   never leaves `latest` stale (it was already set correctly by whichever
+   run originally built it). `discover` also computes `major_latest`: a
+   JSON object mapping each major to its highest patch found (e.g.
+   `{"15":"15.0.6-rootless","16":"16.0.2-rootless"}`), built with a single
+   `awk` pass that overwrites `lat[major]` while walking the
+   already-sorted-ascending `upstream_versions` list — no numeric
+   comparison needed, the last line seen per major is always its highest.
+2. `build`: matrix job (one job per release still needing a build; skipped
+   entirely via `if: needs.discover.outputs.versions != '[]'` when there's
+   nothing new) that builds and pushes the image to GitHub Container
+   Registry (`ghcr.io`), matching the official image's architectures —
+   `amd64`, `arm64`, `arm/v6` (checked via `docker manifest inspect
+   codeberg.org/forgejo/forgejo:15-rootless`) — using QEMU emulation on
+   GitHub's amd64-only hosted runners, all three architectures within the
+   same job for that one release. Each image is tagged with its exact
+   release string (e.g. `16.0.2-rootless`). A `Determine major-line tag`
+   shell step extracts the major from `matrix.forgejo_version` (bash
+   `${VERSION%%.*}`, since GitHub Actions expressions have no string-split
+   function) and looks it up in `major_latest`'s JSON via `jq`; if this
+   release is that major's latest, the image additionally gets a floating
+   `<major>-rootless` tag (e.g. `16.0.2-rootless` also gets `16-rootless`).
+   The release matching `discover`'s `latest` output additionally gets
+   `latest`.
 
 Triggers: push to `main` touching the `Dockerfile` or the workflow
-itself, a weekly schedule (Mondays 03:00 UTC, to absorb upstream
-`15-rootless` updates automatically), and manual `workflow_dispatch`.
+itself, a daily schedule (03:00 UTC, to detect and build any new Forgejo
+release within a day, across every supported major -- cheap on days with
+nothing new, since `discover` just skips the `build` job), and manual
+`workflow_dispatch` (with an optional `forgejo_version` input to force a
+rebuild of one exact release even if already published).
 
 Important operational note: the GHCR package created by the workflow is
 **private by default** on first push, even though the repository is
@@ -202,7 +248,12 @@ authentication.
 - If Alpine ships an urgent Git security fix without changing the version
   number (`git --version`), our build (based on the official GitHub tag)
   won't include it automatically. Watch upstream Git security
-  announcements in case of a critical CVE.
+  announcements in case of a critical CVE. This is more likely to matter
+  now than before: since each exact Forgejo release is only ever built
+  once (its upstream tag never changes, so `discover` never re-selects
+  it), a security fix affecting an already-published release needs a
+  manual `workflow_dispatch` with that release's `forgejo_version` to
+  force a rebuild.
 - If the `-static` package names change in a future major Alpine version
   (which already happened once during development), the build will fail
   at the `apk add` step or at the link step with `cannot find -lXXX`
@@ -210,3 +261,17 @@ authentication.
   (see method above).
 - If Forgejo ever changes its container base (e.g. drops Alpine), all of
   this Git compilation logic needs to be revisited accordingly.
+- The `discover` job relies on `codeberg.org/forgejo/forgejo` staying a
+  publicly readable container repository (anonymous `skopeo list-tags`)
+  and on upstream keeping the `<major>.<minor>.<patch>-rootless` exact tag
+  naming scheme. If either changes, the discovery step needs to be
+  adjusted (or the tag regex updated) before it can find new releases
+  again.
+- `MIN_MAJOR_VERSION` (currently 15) is a workflow-level env var in
+  `docker-build.yml` — bump it there if support for older majors is ever
+  dropped.
+- The already-built/already-published diff in `discover` trusts
+  `ghcr.io`'s tag list as the source of truth for "what's been built" —
+  there is no separate state file to go stale or drift. Manually deleting
+  a version tag from the GHCR package would make `discover` consider it
+  missing again and rebuild it on the next run.

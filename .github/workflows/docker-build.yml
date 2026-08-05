@@ -16,6 +16,13 @@ name: Build and publish Docker image
 #     digest against the digest recorded in our own image's
 #     org.forgejo-urandom-compat.source-digest label, so only the
 #     genuinely-changed release gets rebuilt, not the whole history.
+# Each build pulls a pre-built, statically-linked, /dev/urandom-patched
+# Git from github.com/mbarbeaux/git-urandom-compat instead of compiling it
+# here -- see the Dockerfile's git-fetcher stage for how it detects the
+# right version and architecture. That repository's daily schedule
+# deliberately runs 3 hours ahead of this one's, so the Git version a
+# given Forgejo release needs has normally already been published there
+# by the time this workflow looks for it.
 # Runs on push (if the Dockerfile or this workflow change), on a daily
 # schedule (to catch new releases within a day, with no manual
 # intervention -- the discover job is cheap and skips the build job

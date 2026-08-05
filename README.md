@@ -7,10 +7,13 @@
 This repository contains a `Dockerfile` that rebuilds the official
 [`codeberg.org/forgejo/forgejo`](https://codeberg.org/forgejo/forgejo)
 `<major>.<minor>.<patch>-rootless` images (every 15.x.y release and any
-newer major published upstream) with a **recompiled Git binary**, to make
-them compatible with Synology NAS devices (and more generally any system
-running a **Linux kernel older than 3.17**, such as the 3.10 kernel used
-by many Synology models even under recent DSM 7.x/7.3).
+newer major published upstream) with a **statically-linked, patched Git
+binary**, to make them compatible with Synology NAS devices (and more
+generally any system running a **Linux kernel older than 3.17**, such as
+the 3.10 kernel used by many Synology models even under recent
+DSM 7.x/7.3). The Git binary itself is pulled pre-built from
+[git-urandom-compat](https://github.com/mbarbeaux/git-urandom-compat)
+rather than compiled here — see [How it works](#how-it-works).
 
 ## The problem being solved
 
@@ -30,10 +33,13 @@ compiled to use this call **with no fallback** to the older method
 (`/dev/urandom`), which breaks Git on older kernels — kernels that many
 Synology NAS devices still run, including on recently sold models.
 
-**Solution:** this `Dockerfile` recompiles Git from source, with the
-options needed to force the use of `/dev/urandom` (compatible with any
-kernel), and links the binary **statically** for extra robustness and
-portability.
+**Solution:** replace Alpine's `git` with a statically-linked build patched
+to force the use of `/dev/urandom` (compatible with any kernel). That Git
+binary is compiled once per Git release by
+[git-urandom-compat](https://github.com/mbarbeaux/git-urandom-compat) and
+pulled in here, rather than recompiled independently for every Forgejo
+release — most consecutive Forgejo releases bundle the exact same Git
+version, so compiling it again for each one was pure waste.
 
 ## Usage
 
@@ -80,26 +86,49 @@ docker build -t forgejo-urandom-compat --build-arg FORGEJO_TAG=16.0.2-rootless .
 The `Dockerfile`:
 
 1. Starts from the official Forgejo image as-is (`forgejo-original`).
-2. In a build stage (`git-builder`), **based on that same image**,
-   installs the build tools, then:
-   - automatically detects the Git version already installed
-     (`git --version`), to recompile exactly the same version — with
-     nothing to type manually;
-   - downloads the matching sources from GitHub;
-   - recompiles them with `CSPRNG_METHOD=` (empty), to force the fallback
-     to `/dev/urandom` instead of `getrandom()`;
-   - links the result statically (`LDFLAGS="-static"`), for a fully
-     self-contained binary, with no dependency on `musl`/`libcurl`/etc.;
-   - automatically verifies, via two checks, that the resulting binary is
-     indeed static **and** does use `/dev/urandom` (the build explicitly
-     fails otherwise).
-3. In the final image, removes Alpine's `git` package (to prevent a future
-   `apk upgrade` from overwriting it) and copies our compiled binary in
-   its place.
+2. In a `git-fetcher` stage, **based on that same image**: detects the
+   Git version already installed (`git --version`) — exactly what the
+   old recompile-in-place design did, and for a related reason: this
+   build produces `amd64`/`arm64`/`arm/v6` in one multi-platform
+   invocation, and each platform's copy of this stage runs under its own
+   emulation, so each one independently reads its OWN Forgejo image's
+   bundled Git version (there's no guarantee Forgejo's per-architecture
+   images were all built from byte-identical Alpine package snapshots).
+   It then uses `skopeo copy` to fetch the matching release from
+   [`ghcr.io/mbarbeaux/git-urandom-compat`](https://github.com/mbarbeaux/git-urandom-compat)
+   directly — a statically-linked, `/dev/urandom`-patched Git, tagged by
+   exact Git version — and extracts it. `skopeo` itself, installed via
+   `apk`, is the correct native binary for whichever platform is
+   currently building (same mechanism that lets `apk` resolve
+   per-architecture packages under emulation), so it automatically
+   resolves `git-urandom-compat`'s multi-arch tag to the matching
+   platform. It then verifies the fetched binary is indeed static **and**
+   does use `/dev/urandom` (belt and suspenders —
+   `git-urandom-compat` already checks this at its own build time).
+3. In the final image, removes Alpine's `git` package (to prevent a
+   future `apk upgrade` from overwriting it) and copies the fetched
+   binary in its place.
 
-See the comments in the `Dockerfile` for the details of each technical
-choice (library link order, symbol conflict with `libidn2`, etc.) — see
-also `CLAUDE.md` for the full history of the debugging process.
+This couldn't be a plain multi-stage `FROM ghcr.io/.../git-urandom-compat:
+<version>`, because a Dockerfile's `FROM` target has to be resolved
+before the build starts — it can't depend on a value (the detected Git
+version) computed by an earlier stage's `RUN` output. Fetching via
+`skopeo copy` inside a `RUN` step sidesteps that limitation entirely,
+while still reading the Git version from the right place: the actual
+Forgejo image being built, per platform, not a value computed once
+outside the build.
+
+For a local one-off build, nothing extra is needed — `GIT_VERSION` is
+detected automatically, just like `FORGEJO_TAG`'s Git version used to be:
+
+```bash
+docker build -t forgejo-urandom-compat --build-arg FORGEJO_TAG=16.0.2-rootless .
+```
+
+See the comments in the `Dockerfile` for further details — see also
+`CLAUDE.md` for the full history of the debugging process, and
+[git-urandom-compat](https://github.com/mbarbeaux/git-urandom-compat) for
+how the Git binary itself is built.
 
 ## Pre-built image (GitHub Actions CI)
 

@@ -7,14 +7,22 @@ Context for Claude (or any future revival of this repository).
 A single `Dockerfile` that rebuilds the official
 `codeberg.org/forgejo/forgejo:<major>.<minor>.<patch>-rootless` images
 (every 15.x.y release and any newer major), replacing Alpine's `git`
-binary with a version recompiled from source, to make it usable on a
-Linux kernel older than 3.17 (typically Synology NAS devices, many models
-of which still run kernel 3.10 even under recent DSM — DSM 7.2, 7.3...).
-The base tag is selected via the `FORGEJO_TAG` build arg (default
-`15-rootless`, the floating tag for the latest 15.x.y release); the CI
-workflow discovers every upstream release automatically and builds one
-image per release not yet published (see
+binary with a statically-linked, `/dev/urandom`-patched build, to make it
+usable on a Linux kernel older than 3.17 (typically Synology NAS devices,
+many models of which still run kernel 3.10 even under recent DSM —
+DSM 7.2, 7.3...). The base tag is selected via the `FORGEJO_TAG` build arg
+(default `15-rootless`, the floating tag for the latest 15.x.y release);
+the CI workflow discovers every upstream release automatically and builds
+one image per release not yet published (see
 [CI/CD](#cicd-github-actions) below).
+
+**This repository no longer compiles Git itself.** It fetches a pre-built
+binary from [git-urandom-compat](https://github.com/mbarbeaux/git-urandom-compat)
+instead — see [Chosen solution](#chosen-solution-fetch-a-pre-built-git-instead-of-recompiling-it)
+below for why, and that repository's own `CLAUDE.md` for the actual
+compile recipe (options, Alpine packages, verification checks) — it's
+unchanged from what used to live in this repository's `Dockerfile`,
+just relocated.
 
 Do not confuse this with a rework of Forgejo itself: only the Git binary
 is replaced, everything else in the image (Forgejo/Gitea, its
@@ -80,95 +88,80 @@ This error appears as soon as you try to create a repository (or run any
   3.10 even on DSM 7.3, the latest fully supported version at the time of
   writing.
 
-## Chosen solution: recompile Git inside the official image itself
+## Chosen solution: fetch a pre-built Git instead of recompiling it
 
-See `Dockerfile` — a 3-stage approach:
+See `Dockerfile` — a 2-stage approach:
 
 1. `FROM codeberg.org/forgejo/forgejo:${FORGEJO_TAG} AS forgejo-original`
    (`FORGEJO_TAG` defaults to `15-rootless`): reference image, used twice
-   (as the build base AND the final base), to guarantee zero environment
+   (as the fetch base AND the final base), to guarantee zero environment
    drift (same Alpine/musl version as the image being modified).
-2. `git-builder` stage, **`FROM forgejo-original`** (not a separate
-   Alpine image): we directly query the `git --version` already
-   installed in that image to know the exact version to recompile,
-   without hardcoding anything. We download the matching GitHub tag,
-   recompile with the options below, and verify the result.
-3. Final image: we start again from the untouched `forgejo-original`,
-   remove the apk `git` package (`apk del`, to prevent a future
-   `apk upgrade` from reintroducing the broken Git), and copy the
-   compiled files in its place.
+2. `git-fetcher` stage, **`FROM forgejo-original`** (not a separate
+   Alpine image): directly queries the `git --version` already installed
+   in that image, exactly like the old design used to, to know exactly
+   which Git version to fetch — then, instead of downloading the GitHub
+   source tag and compiling it, uses `skopeo copy` to pull the matching
+   release from `ghcr.io/mbarbeaux/git-urandom-compat` and extracts it
+   (see "Why `skopeo copy` in a `RUN`, not `FROM`" below), verifying the
+   result the same way the old compile step did.
+3. Final image: starts again from the untouched `forgejo-original`,
+   removes the apk `git` package (`apk del`, to prevent a future
+   `apk upgrade` from reintroducing the broken Git), and copies the
+   fetched files in its place.
 
-### Critical compile options (`make` invocation)
+This was **originally a single self-contained `git-builder` stage that
+recompiled Git from source** (the actual `make`/`CSPRNG_METHOD=`/static
+-link recipe, the Alpine `-static` package list, and the two verification
+checks are documented in `git-urandom-compat`'s own `CLAUDE.md` now, byte
+-for-byte the same as what used to be here). That approach was split out
+into its own repository after noticing that 10 consecutive Forgejo
+releases (15.0.0 through 16.0.2) all embedded the exact same Git version
+(2.52.0) — recompiling it independently for every one of them, each
+taking roughly an hour due to QEMU cross-compilation, was pure redundant
+CI time. See `git-urandom-compat/CLAUDE.md` for the full reasoning.
 
-```
-make -j"$(nproc)" \
-    LDFLAGS="-static -Wl,--allow-multiple-definition" \
-    CURL_LIBCURL="$(pkg-config --static --libs libcurl)" \
-    CSPRNG_METHOD= \
-    NO_GETTEXT=1 NO_PERL=1 NO_TCLTK=1 NO_GITWEB=1 \
-    DESTDIR=/build install
-```
+### Why `skopeo copy` in a `RUN`, not `FROM`
 
-- **`CSPRNG_METHOD=`** (empty, explicit): the central fix. Forces the
-  fallback to `/dev/urandom` instead of `getrandom(2)` (see root cause
-  point 3 above).
-- **`LDFLAGS="-static"`**: static linking requested, for a fully
-  self-contained binary (no dependency on `musl`/`libcurl`/etc. in the
-  final image). The result is reported by `file` as `static-pie linked`
-  (not plain `statically linked`) — this is normal and still a static
-  binary, just with PIE relocation.
-- **`-Wl,--allow-multiple-definition`**: needed because `libidn2`
-  (a transitive static dependency of `curl`) bundles an `error()`
-  function via `gnulib`, which collides by name with the `error()`
-  function in Git's own `usage.c`. Without this flag, linking fails with
-  `multiple definition of 'error'`.
-- **`CURL_LIBCURL="$(pkg-config --static --libs libcurl)"`**: works
-  around Git's internal detection (`CURL_STATIC=YesPlease` → `curl-config
-  --static-libs`), which turned out to be **incomplete** on the Alpine
-  version tested (it omitted OpenSSL, nghttp2, c-ares, libpsl, brotli,
-  zstd from the link line). `pkg-config --static` reads curl's standard
-  `Libs.private` `.pc` field, and proved reliable for getting the full
-  dependency chain, in the right order.
-- **`NO_GETTEXT` / `NO_PERL` / `NO_TCLTK` / `NO_GITWEB`**: aligned with
-  what Alpine's official `git` package already doesn't bundle (its
-  runtime dependencies list neither perl nor gettext), to stay consistent
-  and limit the build surface.
+The natural-looking design would be a plain multi-stage
+`FROM ghcr.io/mbarbeaux/git-urandom-compat:${GIT_VERSION} AS git-source`
+followed by `COPY --from=git-source`. This doesn't work here: a
+Dockerfile's `FROM` target has to be resolved before the build starts, so
+it can't be parameterized by a value (the detected Git version) computed
+by an earlier stage's `RUN` output within the SAME build. The only way to
+use a `FROM`-based design would be to detect the Git version OUTSIDE the
+Dockerfile (e.g. a CI step running `docker run ... git --version` on the
+target Forgejo image) and pass it in as a build-arg -- this was tried
+first and reverted, because it can only check ONE platform (the CI
+runner is amd64-only) and then reuses that single detected version as the
+build-arg for EVERY platform in the multi-arch build. If Forgejo's
+per-architecture images were ever NOT built from byte-identical Alpine
+package snapshots (not guaranteed, even if true in practice today), that
+single amd64-detected version would silently get baked into the arm64
+and arm/v6 builds too, even if those platforms actually bundled a
+different Git version.
 
-### Alpine packages needed for static linking
+`skopeo copy` inside a `RUN` step avoids this entirely: it runs INSIDE
+each platform's own copy of the `git-fetcher` stage (under QEMU emulation
+for arm64/arm-v6, same as the old compile step did), so `git --version`
+there reads THAT platform's actual bundled Git version, and `skopeo`
+itself -- installed via `apk`, so it's the correct native binary for
+whatever platform is currently building -- automatically resolves
+`git-urandom-compat`'s own multi-arch tag to the matching platform when
+fetching. This mirrors exactly how `apk add` itself already resolves the
+right per-architecture packages under emulation elsewhere in this
+Dockerfile; extending that same trust to `skopeo` was a deliberate
+choice, not an oversight.
 
-On recent Alpine, static libraries (`.a` files) are split out of the
-usual `-dev` packages into dedicated `-static` packages. Full list used
-(determined through successive iterations, resolving each
-`cannot find -lXXX` one by one):
-
-```
-build-base autoconf pkgconf
-curl-dev curl-static
-expat-dev expat-static
-pcre2-dev pcre2-static
-zlib-dev zlib-static
-openssl-dev openssl-libs-static
-nghttp2-static
-brotli-static
-zstd-static
-libpsl-static
-libidn2-static
-libunistring-static
-```
-
-### Two automatic checks built into the build
-
-The `Dockerfile` deliberately fails the build (`exit 1`) if either of
-these two conditions isn't met — so **a successful build is itself proof
-that the fix is active**:
-
-1. `strings /build/usr/bin/git | grep "^/dev/urandom$"` must find the
-   string — confirms that the fallback branch (not `getrandom()`) was
-   indeed compiled in. Verified by directly reading the `wrapper.c`
-   source: this literal string only appears in the final `#else` branch
-   of `csprng_bytes()`.
-2. `file /build/usr/bin/git` must contain `statically linked` **or**
-   `static-pie linked`.
+Mechanically: `skopeo copy docker://<ref> dir:/tmp/git-oci` writes an OCI
+image layout (a `manifest.json` plus one file per blob) rather than
+running or exporting the image directly (skopeo isn't a container
+runtime, it can't "run" anything). The image is `FROM scratch` with
+exactly 3 `COPY` layers (`/bin/git*`, `/libexec/git-core/`,
+`/share/git-core/`), each a `tar+gzip` blob — so extracting every layer
+listed in `manifest.json`'s `.layers[]`, in order, into the same
+destination directory reconstructs the exact rootfs Docker itself would
+have produced via `COPY --from=`. Verified locally end-to-end, including
+under `riscv64` QEMU emulation, before ever relying on it in CI.
 
 ### Runtime constraint: `USER root` / `USER 1000`
 
@@ -180,10 +173,20 @@ user's existing `docker-compose.yml` configuration).
 
 ## Validated state
 
-Build tested and working on an **aarch64** (ARM) architecture, with
-Git 2.52.0, on a `codeberg.org/forgejo/forgejo:15-rootless` image based
-on Alpine 3.23. **Tested in production on a Synology DSM 7.2
-(kernel 3.10.108)**: repository creation works.
+Original recompile-in-place design: build tested and working on an
+**aarch64** (ARM) architecture, with Git 2.52.0, on a
+`codeberg.org/forgejo/forgejo:15-rootless` image based on Alpine 3.23.
+**Tested in production on a Synology DSM 7.2 (kernel 3.10.108)**:
+repository creation works.
+
+Current `skopeo`-fetch design: full end-to-end `docker build` (both
+stages, urandom + static checks, `git init`/`git commit`) verified
+locally for `linux/amd64`. The per-platform `skopeo`-under-emulation
+extraction mechanism itself was verified separately, under `riscv64`
+QEMU emulation, while building `git-urandom-compat`. The `arm64`/`arm/v6`
+legs specifically, inside THIS repository's own multi-platform build,
+get their first real validation from the CI run that follows this
+change -- not yet independently re-tested locally before that.
 
 ## CI/CD (GitHub Actions)
 
@@ -280,13 +283,27 @@ authentication.
   is exactly as stale as upstream's own, and watching upstream Git
   security advisories is the only recourse for a critical CVE in that
   case.
-- If the `-static` package names change in a future major Alpine version
-  (which already happened once during development), the build will fail
-  at the `apk add` step or at the link step with `cannot find -lXXX`
-  errors — in that case, identify the missing library symbol by symbol
-  (see method above).
-- If Forgejo ever changes its container base (e.g. drops Alpine), all of
-  this Git compilation logic needs to be revisited accordingly.
+- The `-static` package / static-link fragility documented above (Alpine
+  renaming `-static` packages, curl's incomplete static-libs detection,
+  etc.) no longer applies to THIS repository at all -- that risk now lives
+  entirely in `git-urandom-compat`, since this repository doesn't compile
+  anything anymore. Check there if a Git version fails to build.
+- This repository now has a HARD runtime dependency on
+  `ghcr.io/mbarbeaux/git-urandom-compat` being public and having already
+  published whatever Git version the Forgejo release being built bundles
+  -- if that version isn't there yet, `skopeo copy` in the `git-fetcher`
+  stage fails the build outright, with no fallback to compiling locally.
+  This is why `git-urandom-compat`'s daily schedule runs 3 hours ahead of
+  this repository's own (see [CI/CD](#cicd-github-actions) below); if that
+  margin ever turns out to be too tight, or if `git-urandom-compat`'s own
+  package visibility ever reverts to private, this repository's builds
+  will fail with a clear `skopeo`/`403`/`manifest unknown` error at the
+  `git-fetcher` stage, not a subtle miscompile.
+- If Forgejo ever changes its container base (e.g. drops Alpine), the
+  `git-fetcher` stage's `apk add skopeo jq` and the final stage's
+  `apk del git` both assume Alpine/`apk` are present -- would need
+  revisiting accordingly (as would `git-urandom-compat`, on its own
+  side, for the actual Git build).
 - The `discover` job relies on `codeberg.org/forgejo/forgejo` staying a
   publicly readable container repository (anonymous `skopeo list-tags`)
   and on upstream keeping the `<major>.<minor>.<patch>-rootless` exact tag

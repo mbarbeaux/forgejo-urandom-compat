@@ -213,6 +213,26 @@ on Alpine 3.23. **Tested in production on a Synology DSM 7.2
    `awk` pass that overwrites `lat[major]` while walking the
    already-sorted-ascending `upstream_versions` list — no numeric
    comparison needed, the last line seen per major is always its highest.
+   It also computes `source_digests`: a JSON object mapping EVERY upstream
+   release to its current manifest digest, via `skopeo inspect --raw |
+   sha256sum` (not `skopeo inspect`'s own `.Digest` field, which resolves
+   to the runner's own platform's child manifest instead of the stable
+   index digest that changes when ANY platform's content changes). This
+   feeds two things: the `FORGEJO_SOURCE_DIGEST` build-arg for whatever
+   gets built this run, and a DRIFT CHECK against already-built releases —
+   for each one, `discover` reads back its own
+   `org.forgejo-urandom-compat.source-digest` label (see Dockerfile) via
+   `skopeo inspect` and compares it to upstream's current digest; a
+   mismatch adds that release back into the build matrix even though its
+   version string was already published (this is how an Alpine/Git
+   security backport re-pushed under the same Forgejo tag still gets
+   picked up). A MISSING label (a release built before this label
+   existed) is deliberately NOT treated as drift: the alternative would
+   have forced a one-off rebuild of every already-published release the
+   first time this ran, just to backfill the label, which was judged not
+   worth it -- those specific releases simply aren't drift-protected until
+   manually rebuilt (`workflow_dispatch`) or naturally superseded.
+   `versions` ends up as `missing ∪ drifted`, deduped.
 2. `build`: matrix job (one job per release still needing a build; skipped
    entirely via `if: needs.discover.outputs.versions != '[]'` when there's
    nothing new) that builds and pushes the image to GitHub Container
@@ -221,14 +241,16 @@ on Alpine 3.23. **Tested in production on a Synology DSM 7.2
    codeberg.org/forgejo/forgejo:15-rootless`) — using QEMU emulation on
    GitHub's amd64-only hosted runners, all three architectures within the
    same job for that one release. Each image is tagged with its exact
-   release string (e.g. `16.0.2-rootless`). A `Determine major-line tag`
-   shell step extracts the major from `matrix.forgejo_version` (bash
-   `${VERSION%%.*}`, since GitHub Actions expressions have no string-split
-   function) and looks it up in `major_latest`'s JSON via `jq`; if this
-   release is that major's latest, the image additionally gets a floating
-   `<major>-rootless` tag (e.g. `16.0.2-rootless` also gets `16-rootless`).
-   The release matching `discover`'s `latest` output additionally gets
-   `latest`.
+   release string (e.g. `16.0.2-rootless`). A `Determine major-line tag
+   and source digest` shell step extracts the major from
+   `matrix.forgejo_version` (bash `${VERSION%%.*}`, since GitHub Actions
+   expressions have no string-split function), looks it up in
+   `major_latest`'s JSON via `jq` to decide the floating
+   `<major>-rootless` tag (e.g. `16.0.2-rootless` also gets
+   `16-rootless`), and looks up this version's entry in `source_digests`
+   to pass as the `FORGEJO_SOURCE_DIGEST` build-arg, baked into the image's
+   label by the Dockerfile. The release matching `discover`'s `latest`
+   output additionally gets `latest`.
 
 Triggers: push to `main` touching the `Dockerfile` or the workflow
 itself, a daily schedule (03:00 UTC, to detect and build any new Forgejo
@@ -245,15 +267,19 @@ authentication.
 
 ## Points of attention for a future revival
 
-- If Alpine ships an urgent Git security fix without changing the version
-  number (`git --version`), our build (based on the official GitHub tag)
-  won't include it automatically. Watch upstream Git security
-  announcements in case of a critical CVE. This is more likely to matter
-  now than before: since each exact Forgejo release is only ever built
-  once (its upstream tag never changes, so `discover` never re-selects
-  it), a security fix affecting an already-published release needs a
-  manual `workflow_dispatch` with that release's `forgejo_version` to
-  force a rebuild.
+- Alpine/Git security fixes shipped by upstream WITHOUT a new Forgejo
+  release tag are handled automatically as long as upstream actually
+  re-pushes the affected release's image (the source-digest drift check
+  in `discover` picks it up, see [CI/CD](#cicd-github-actions) above). The
+  remaining gap is narrower than it sounds: (1) releases built before the
+  `org.forgejo-urandom-compat.source-digest` label existed aren't
+  drift-checked (missing label = assumed up to date) -- force a rebuild
+  via `workflow_dispatch` for one of those specific releases if it turns
+  out to need one; (2) if upstream never re-pushes the affected tag at
+  all, there's genuinely nothing to detect or fix on our side -- our image
+  is exactly as stale as upstream's own, and watching upstream Git
+  security advisories is the only recourse for a critical CVE in that
+  case.
 - If the `-static` package names change in a future major Alpine version
   (which already happened once during development), the build will fail
   at the `apk add` step or at the link step with `cannot find -lXXX`

@@ -140,6 +140,17 @@ COPY --from=git-builder /build/usr/share/git-core/ /usr/share/git-core/
 
 RUN git --version
 
+# Records the upstream manifest digest this image was built from, as an
+# OCI label. FORGEJO_TAG alone isn't enough to know whether the source
+# image actually changed since our last build: upstream release tags are
+# expected to be immutable, but if one is ever re-pushed in place (e.g. an
+# Alpine/Git security backport with no new Forgejo release), its digest
+# changes even though the tag string doesn't. The CI workflow reads this
+# label back on subsequent runs to detect that drift and rebuild only the
+# affected version -- see .github/workflows/docker-build.yml.
+ARG FORGEJO_SOURCE_DIGEST=""
+LABEL org.forgejo-urandom-compat.source-digest="${FORGEJO_SOURCE_DIGEST}"
+
 # Switch back to the original non-root user so the container keeps
 # running exactly as the official rootless image intends.
 USER 1000

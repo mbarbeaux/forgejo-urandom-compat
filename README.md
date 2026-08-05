@@ -153,13 +153,18 @@ and switch its visibility to *Public* to allow an unauthenticated
   the compiled binary doesn't use `/dev/urandom` — so a
   `docker build` that finishes without error is itself a guarantee that
   the fix is active.
-- **Known limitation**: because each release is built once and never
-  rebuilt (its upstream tag is immutable), an Alpine/Git security fix
-  shipped by upstream *without* a new Forgejo release tag won't reach an
-  already-published image automatically. Use the manual
-  `workflow_dispatch` (`forgejo_version` input) to force a rebuild of an
-  affected release if that ever happens, and watch upstream Git security
-  advisories in case of a critical CVE.
+- **Staying fresh even if an upstream tag is re-pushed**: upstream release
+  tags are expected to be immutable, but the workflow doesn't just take
+  that on faith. Every build records the upstream manifest digest it was
+  built from in an `org.forgejo-urandom-compat.source-digest` label; each
+  run compares that label against upstream's *current* digest for every
+  already-built release, and rebuilds only the ones that drifted (e.g. an
+  Alpine/Git security backport re-pushed under the same Forgejo tag) —
+  everything unchanged stays untouched. The one gap is releases built
+  before this label existed: they're assumed up to date rather than
+  triggering a one-off rebuild wave, so if one of those specific releases
+  needs a rebuild, force it manually via `workflow_dispatch`
+  (`forgejo_version` input).
 
 ## Origin
 

@@ -9,9 +9,13 @@ name: Build and publish Docker image
 #   - a brand new major (e.g. 17.0.0-rootless) is picked up automatically;
 #   - a new patch on an existing major (e.g. 16.0.3-rootless) is picked up
 #     automatically too;
-#   - a release that was already built in a previous run is never rebuilt
-#     (exact version tags are immutable upstream, so there is nothing to
-#     gain from rebuilding them -- this saves CI/runner time).
+#   - a release that was already built in a previous run is never rebuilt,
+#     UNLESS upstream silently re-pushed that same tag with different
+#     content (e.g. an Alpine/Git security backport with no new Forgejo
+#     release) -- detected by comparing upstream's current manifest
+#     digest against the digest recorded in our own image's
+#     org.forgejo-urandom-compat.source-digest label, so only the
+#     genuinely-changed release gets rebuilt, not the whole history.
 # Runs on push (if the Dockerfile or this workflow change), on a daily
 # schedule (to catch new releases within a day, with no manual
 # intervention -- the discover job is cheap and skips the build job
@@ -64,6 +68,7 @@ jobs:
       versions: ${{ steps.discover.outputs.versions }}
       latest: ${{ steps.discover.outputs.latest }}
       major_latest: ${{ steps.discover.outputs.major_latest }}
+      source_digests: ${{ steps.discover.outputs.source_digests }}
     steps:
       - name: Install skopeo
         run: sudo apt-get update && sudo apt-get install -y skopeo
@@ -105,6 +110,23 @@ jobs:
             '{lat[$1]=$0} END {printf "{"; sep=""; for (m in lat) {printf "%s\"%s\":\"%s\"", sep, m, lat[m]; sep=","}; printf "}"}' \
             | jq -c .)"
 
+          # Upstream's current manifest digest for every release, keyed by
+          # version (e.g. {"16.0.2-rootless":"sha256:...",...}). Used both
+          # as the FORGEJO_SOURCE_DIGEST build-arg for whatever gets built
+          # this run, and below to detect if an already-built release was
+          # silently re-pushed by upstream since we built it. `--raw` +
+          # sha256sum, rather than `skopeo inspect`'s own Digest field,
+          # because the latter resolves to the runner's own platform's
+          # child manifest -- the raw index digest is what actually
+          # changes if ANY platform's content changes, and doesn't depend
+          # on which platform this job happens to run on.
+          upstream_digests_json="{}"
+          while IFS= read -r v; do
+            [ -z "${v}" ] && continue
+            d="sha256:$(skopeo inspect --raw "docker://codeberg.org/forgejo/forgejo:${v}" | sha256sum | awk '{print $1}')"
+            upstream_digests_json="$(echo "${upstream_digests_json}" | jq --arg v "${v}" --arg d "${d}" '. + {($v): $d}')"
+          done <<< "${upstream_versions}"
+
           # Log in read-only to check our own already-published tags, even
           # if the ghcr.io package is private. A missing package (first
           # ever run) is not an error: it just means nothing is built yet.
@@ -121,6 +143,27 @@ jobs:
             built_versions=""
           fi
 
+          # Drift check: among already-built releases, which ones does
+          # upstream's current digest no longer match what we recorded at
+          # build time? A missing label (built before this label existed)
+          # is NOT treated as drift -- it's assumed up to date rather than
+          # forcing a one-off rebuild wave; only releases that actually
+          # carry a mismatching label get flagged.
+          drifted=""
+          if [ -n "${built_versions}" ]; then
+            while IFS= read -r v; do
+              [ -z "${v}" ] && continue
+              our_digest="$(skopeo inspect "docker://${REGISTRY}/${IMAGE_NAME}:${v}" 2>/dev/null \
+                | jq -r '.Labels["org.forgejo-urandom-compat.source-digest"] // ""')"
+              [ -z "${our_digest}" ] && continue
+              up_digest="$(echo "${upstream_digests_json}" | jq -r --arg v "${v}" '.[$v] // ""')"
+              if [ "${our_digest}" != "${up_digest}" ]; then
+                drifted="${drifted}${v}"$'\n'
+              fi
+            done <<< "${built_versions}"
+          fi
+          drifted="$(echo "${drifted}" | sed '/^$/d' | sort -u)"
+
           if [ -n "${REQUESTED_VERSION}" ]; then
             if ! echo "${upstream_versions}" | grep -qx "${REQUESTED_VERSION}"; then
               echo "Requested version '${REQUESTED_VERSION}' was not found among published upstream releases:" >&2
@@ -130,22 +173,26 @@ jobs:
             echo "Manual override: forcing a rebuild of ${REQUESTED_VERSION} regardless of already-built state."
             to_build="${REQUESTED_VERSION}"
           else
-            to_build="$(comm -23 <(echo "${upstream_versions}") <(echo "${built_versions}" | sed '/^$/d'))"
+            missing="$(comm -23 <(echo "${upstream_versions}") <(echo "${built_versions}" | sed '/^$/d'))"
+            to_build="$(printf '%s\n%s\n' "${missing}" "${drifted}" | sed '/^$/d' | sort -u)"
           fi
 
           echo "Upstream releases (major >= ${MIN_MAJOR_VERSION}):"
           echo "${upstream_versions}"
           echo "Already published on ${REGISTRY}:"
           echo "${built_versions:-<none>}"
+          echo "Re-pushed upstream since our build (drifted):"
+          echo "${drifted:-<none>}"
           echo "Latest: ${latest}"
           echo "Latest per major: ${major_latest}"
           echo "To build this run:"
-          echo "${to_build:-<nothing -- everything already built>}"
+          echo "${to_build:-<nothing -- everything already built and up to date>}"
 
           {
             echo "versions=$(echo "${to_build}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
             echo "latest=${latest}"
             echo "major_latest=${major_latest}"
+            echo "source_digests=${upstream_digests_json}"
           } >> "$GITHUB_OUTPUT"
 
   build:
@@ -159,25 +206,35 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
+      # Caps how many of these jobs push to ghcr.io at the same time.
+      # Without this, a large catch-up run (e.g. the first run after
+      # lowering MIN_MAJOR_VERSION, or after a long gap) fires many
+      # concurrent multi-arch pushes to the SAME package and can trip
+      # GitHub's secondary API rate limit ("403 ... secondary rate
+      # limit"), failing an otherwise-successful build at the final push
+      # step. Day-to-day runs rarely have more than a couple of new
+      # releases anyway, so this mainly smooths out the rare bulk-catch-up
+      # case at the cost of a bit of wall-clock time.
+      max-parallel: 4
       matrix:
         forgejo_version: ${{ fromJson(needs.discover.outputs.versions) }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # GitHub-hosted runners are amd64 only. QEMU lets buildx also produce
       # the arm64 and arm/v6 images, to exactly match the architectures
       # published by the official codeberg.org/forgejo/forgejo image, all
       # within this single job for this one Forgejo release.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -186,13 +243,16 @@ jobs:
       # Determines whether this job's release is the latest patch of its
       # own major line, to decide whether it should also get the floating
       # "<major>-rootless" tag (e.g. 16.0.2-rootless -> also tag
-      # 16-rootless). Done in shell rather than a workflow expression:
+      # 16-rootless), and looks up the upstream digest this release
+      # should be built from, to bake into the source-digest label (see
+      # Dockerfile). Done in shell rather than a workflow expression:
       # GitHub Actions expressions have no string-splitting function to
       # pull the major out of "16.0.2-rootless".
-      - name: Determine major-line tag
+      - name: Determine major-line tag and source digest
         id: majortag
         env:
           MAJOR_LATEST_JSON: ${{ needs.discover.outputs.major_latest }}
+          SOURCE_DIGESTS_JSON: ${{ needs.discover.outputs.source_digests }}
           VERSION: ${{ matrix.forgejo_version }}
         run: |
           set -euo pipefail
@@ -202,12 +262,16 @@ jobs:
           if [ "${latest_for_major}" = "${VERSION}" ]; then
             is_latest="true"
           fi
-          echo "tag=${major}-rootless" >> "$GITHUB_OUTPUT"
-          echo "is_major_latest=${is_latest}" >> "$GITHUB_OUTPUT"
+          source_digest="$(echo "${SOURCE_DIGESTS_JSON}" | jq -r --arg v "${VERSION}" '.[$v] // ""')"
+          {
+            echo "tag=${major}-rootless"
+            echo "is_major_latest=${is_latest}"
+            echo "source_digest=${source_digest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -216,11 +280,12 @@ jobs:
             type=raw,value=latest,enable=${{ matrix.forgejo_version == needs.discover.outputs.latest }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           build-args: |
             FORGEJO_TAG=${{ matrix.forgejo_version }}
+            FORGEJO_SOURCE_DIGEST=${{ steps.majortag.outputs.source_digest }}
           # Same architectures as the official image (verified via
           # `docker manifest inspect`): amd64, arm64, arm/v6.
           platforms: linux/amd64,linux/arm64,linux/arm/v6

@@ -77,8 +77,13 @@ jobs:
 
           version_pattern='^[0-9]+\.[0-9]+\.[0-9]+-rootless$'
 
+          # grep exits 1 when nothing matches; under pipefail that would
+          # otherwise take down the whole pipeline (and the script, under
+          # -e) even though "no matching tags" is a perfectly normal
+          # outcome here -- neutralize it with `|| true` rather than
+          # treating an empty result as an error.
           upstream_versions="$(skopeo list-tags docker://codeberg.org/forgejo/forgejo | jq -r '.Tags[]' \
-            | grep -E "${version_pattern}" \
+            | { grep -E "${version_pattern}" || true; } \
             | awk -F. -v min="${MIN_MAJOR_VERSION}" '$1 >= min {print}' \
             | sort -t. -k1,1n -k2,2n -k3,3n)"
 
@@ -107,7 +112,10 @@ jobs:
             --username "${{ github.actor }}" --password-stdin
 
           if built_raw="$(skopeo list-tags "docker://${REGISTRY}/${IMAGE_NAME}" 2>/dev/null)"; then
-            built_versions="$(echo "${built_raw}" | jq -r '.Tags[]?' | grep -E "${version_pattern}" | sort -u)"
+            # Same pipefail/grep gotcha as above: no published version tag
+            # yet (e.g. only "latest"/"sha-*" from a previous scheme) is a
+            # normal empty result, not an error.
+            built_versions="$(echo "${built_raw}" | jq -r '.Tags[]?' | { grep -E "${version_pattern}" || true; } | sort -u)"
           else
             echo "No existing ${IMAGE_NAME} package found on ${REGISTRY} yet -- nothing considered built so far."
             built_versions=""

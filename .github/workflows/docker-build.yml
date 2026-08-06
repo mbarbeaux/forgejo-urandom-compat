@@ -131,7 +131,7 @@ jobs:
           while IFS= read -r v; do
             [ -z "${v}" ] && continue
             d="sha256:$(skopeo inspect --raw "docker://codeberg.org/forgejo/forgejo:${v}" | sha256sum | awk '{print $1}')"
-            upstream_digests_json="$(echo "${upstream_digests_json}" | jq --arg v "${v}" --arg d "${d}" '. + {($v): $d}')"
+            upstream_digests_json="$(echo "${upstream_digests_json}" | jq -c --arg v "${v}" --arg d "${d}" '. + {($v): $d}')"
           done <<< "${upstream_versions}"
 
           # Log in read-only to check our own already-published tags, even
